@@ -3,6 +3,8 @@
 ## nexcsi 0.5.2
 
 Upstream: https://github.com/nexmonster/nexcsi — PyPI: `nexcsi==0.5.2`
+**License: MIT**, Copyright (c) nexmonster. Retained unmodified; see
+`../LICENSE`.
 
 **Unmodified.** Extracted from the official wheel
 (`nexcsi-0.5.2-py3-none-any.whl`, sha in `nexcsi-0.5.2.dist-info/RECORD`).
