@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+Overview of one CSI capture: the channel over time, and its mean shape.
+
+  bin/csi-plot <capture.pcap> [-o out.png] [--fctl 0x08] [--normalize]
+               [--trace N,N,N]
+
+  --fctl       frame type to keep (default: auto, most numerous non-beacon)
+  --normalize  remove each packet's own level (AGC) before plotting
+  --trace      subcarrier(s) for the bottom panel (default -21; pass a
+               comma-separated list for more, e.g. --trace -21,-7,7,21)
+
+Three panels, top to bottom:
+
+  (a) |H| over time x subcarrier          the canonical CSI view
+  (b) mean channel frequency response     the channel's shape, with +/-1 sigma
+  (c) one subcarrier over time            what a single bin actually does
+
+Arrival times are NOT uniform, so panel (a) resamples onto a uniform grid and
+leaves real gaps blank rather than interpolating across them - a solid block
+of colour where nothing was received is a lie the eye cannot detect.
+"""
+import argparse
+import os
+import sys
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
+from scipy.ndimage import median_filter
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+import csitools  # noqa: E402
+
+# Repo plot language (see bin/csi-plot-activity, bin/csi-plot-streams).
+INK, MUTED, GRID = "#1f2328", "#5b6570", "#dfe3e8"
+ACCENT = "#2a66a3"
+# Sequential = ONE hue, light -> dark. Magnitude has no polarity, so no
+# diverging map and no rainbow.
+SEQ = LinearSegmentedColormap.from_list(
+    "seq", ["#eef4fa", "#cfe0f0", "#95bede", "#5590c4", "#2a66a3", "#123f6b"])
+TRACE = ["#123f6b", "#2a66a3", "#5590c4", "#95bede"]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("pcap")
+    ap.add_argument("-o", "--out", default=None)
+    ap.add_argument("--fctl", default="auto")
+    ap.add_argument("--normalize", action="store_true")
+    ap.add_argument("--trace", default="-21",
+                    help="subcarrier(s) for the bottom panel, comma-separated")
+    a = ap.parse_args()
+    out = a.out or os.path.splitext(a.pcap)[0] + ".png"
+
+    fctl = a.fctl if a.fctl == "auto" else int(a.fctl, 0)
+    ts, csi, rssi, macs = csitools.load(a.pcap, fctl=fctl)
+    fctl_used = fctl
+    if fctl == "auto":
+        _a = csitools.audit(a.pcap)
+        fctl_used = next(x["fctl"] for x in _a["types"]
+                         if not x["control"] and x["fctl"] != 0x80)
+    idx, sc = csitools.subcarrier_axis(csi.shape[1])
+    db = 20 * np.log10(np.abs(csi[:, idx]) + 1e-9)
+    if a.normalize:
+        db = csitools.normalize_per_packet(db, method="l2")
+    t = ts - ts[0]
+    fs = len(ts) / (t[-1] - t[0])
+
+    # Honest resampling. Two traps here, both hit in practice:
+    #
+    #   - A grid at the FRAME rate plus a mask at the within-burst cadence
+    #     blanks everything between DTIM bursts and paints the panel 95%
+    #     empty, hiding the data completely.
+    #   - Interpolating across a real multi-second outage invents a channel
+    #     that was never measured.
+    #
+    # So: cap the grid at ~1200 columns so a burst always lands inside a
+    # cell, and mask only genuine outages, using the same threshold as
+    # csitools.audit.
+    d = np.diff(t)
+    step = max(float(np.median(d)), t[-1] / 1200)
+    grid = np.arange(0, t[-1], step)
+    near = np.abs(grid[:, None] - t[None, :]).argmin(axis=1)
+    gapped = np.abs(grid - t[near]) > csitools.OUTAGE_S
+    dead = float(d[d > csitools.OUTAGE_S].sum()) / t[-1]
+    U = np.empty((len(grid), db.shape[1]))
+    for k in range(db.shape[1]):
+        U[:, k] = np.interp(grid, t, db[:, k])
+    U[gapped] = np.nan
+
+    fig, ax = plt.subplots(3, 1, figsize=(12, 10), constrained_layout=True,
+                           gridspec_kw={"height_ratios": [2.2, 1.5, 1.5]})
+
+    # (a) the channel over time --------------------------------------------
+    cmap = SEQ.copy()
+    # Gaps get a warm neutral, deliberately outside the blue ramp. The light
+    # end of a sequential map is a VALUE; "no data" must not look like one.
+    cmap.set_bad("#ddd6cc")
+    lo, hi = np.nanpercentile(U, [1, 99])
+    im = ax[0].imshow(U.T, aspect="auto", origin="lower", cmap=cmap,
+                      vmin=lo, vmax=hi, interpolation="nearest",
+                      extent=[0, grid[-1], sc.min(), sc.max()])
+    ax[0].set_ylabel("subcarrier", color=MUTED, fontsize=9)
+    ax[0].set_title(
+        f"|H| over time   —   {len(ts)} frames, {fs:.0f} Hz, "
+        f"RSSI {rssi.mean():.0f} dBm, {', '.join(macs)}"
+        + (f"      ({dead*100:.0f}% dead — beige)" if dead > 0.02 else ""),
+        color=INK, fontsize=11)
+    cb = fig.colorbar(im, ax=ax[0], fraction=0.03, pad=0.01)
+    cb.set_label("|H| (dB)" + (" , per-packet normalised" if a.normalize else ""),
+                 color=MUTED, fontsize=9)
+    cb.ax.tick_params(colors=MUTED, labelsize=8)
+    cb.outline.set_edgecolor(GRID)
+
+    # (b) mean channel frequency response ----------------------------------
+    m, s = db.mean(axis=0), db.std(axis=0)
+    ax[1].fill_between(sc, m - s, m + s, color=ACCENT, alpha=0.16, lw=0)
+    ax[1].plot(sc, m, lw=2, color=ACCENT)
+    ax[1].set_xlabel("subcarrier", color=MUTED, fontsize=9)
+    ax[1].set_ylabel("|H| (dB)", color=MUTED, fontsize=9)
+    ax[1].set_title(f"Mean channel frequency response, shaded ±1σ   "
+                    f"(mean σ {s.mean():.2f} dB)", color=INK, fontsize=11)
+    ax[1].set_xlim(sc.min(), sc.max())
+
+    # (c) a few subcarriers over time --------------------------------------
+    # Markers, not a line. Arrivals are bursty (the AP releases buffered
+    # broadcast at each DTIM beacon), and a line drawn through that invents
+    # values between bursts. One dot per received frame is what was measured.
+    want = [int(x) for x in a.trace.split(",")]
+
+    # The trend line. Two cases, because one rule does not fit both:
+    #   bunched arrivals (DTIM-batched broadcast) -> one median per cluster;
+    #     a line between clusters would invent values across the gaps.
+    #   evenly spaced arrivals (unicast) -> a rolling median over ~0.25 s;
+    #     there is only ONE cluster, so the per-cluster rule would collapse
+    #     the whole line to a single invisible point.
+    aud = csitools.audit(a.pcap)
+    d_best = next((x for x in aud["types"] if x["fctl"] == fctl_used), None)
+    bunched = bool(d_best and d_best["bunched"])
+    cbrk = np.where(np.diff(t) > csitools.CLUSTER_S)[0]
+    cs = np.r_[0, cbrk + 1]
+    ce = np.r_[cbrk, len(t) - 1]
+    tc = np.array([t[a_:b + 1].mean() for a_, b in zip(cs, ce)])
+
+    for i, w in enumerate(want):
+        k = int(np.argmin(np.abs(sc - w)))
+        col = TRACE[i % len(TRACE)]
+        ax[2].plot(t, db[:, k], ls="none", marker=".", ms=1.6, alpha=0.35,
+                   color=col)
+        if bunched and len(tc) > 2:
+            tt = tc
+            yy = np.array([np.median(db[a_:b + 1, k]) for a_, b in zip(cs, ce)])
+        else:
+            win = max(3, int(0.25 * fs) | 1)
+            tt = t
+            yy = median_filter(db[:, k], size=win, mode="nearest")
+        # break the line across real outages only
+        obrk = np.where(np.diff(tt) > csitools.OUTAGE_S)[0]
+        ax[2].plot(np.insert(tt, obrk + 1, np.nan),
+                   np.insert(yy, obrk + 1, np.nan),
+                   lw=1.2, color=col, label=f"SC {sc[k]:+d}")
+
+    ax[2].set_xlabel("time (s)", color=MUTED, fontsize=9)
+    ax[2].set_ylabel("|H| (dB)", color=MUTED, fontsize=9)
+    ax[2].set_xlim(0, t[-1])
+    # A single series needs no legend box - the title names it.
+    if len(want) > 1:
+        ax[2].legend(frameon=False, labelcolor=INK, fontsize=9, ncol=4,
+                     loc="lower left", bbox_to_anchor=(0, 1.02, 1, 0.1),
+                     mode="expand", borderaxespad=0)
+    # Only call the cluster rate "effective" when arrivals are genuinely
+    # bunched. Evenly spaced frames each sample the channel independently, so
+    # quoting a cluster rate there understates the capture badly.
+    if bunched:
+        sub = (f"{len(tc)} clusters, {len(tc)/t[-1]:.1f} Hz effective — "
+               f"frames arrive in batches, so the frame rate overstates it")
+    else:
+        sub = (f"evenly spaced, {np.median(np.diff(t))*1e3:.1f} ms cadence "
+               f"= {fs:.0f} Hz")
+    if len(want) == 1:
+        k0 = int(np.argmin(np.abs(sc - want[0])))
+        head = f"Subcarrier {sc[k0]:+d} over time"
+        pad = 8
+    else:
+        head = "Individual subcarriers over time"
+        pad = 26
+    ax[2].set_title(f"{head} — dots are frames, line is the trend ({sub})",
+                    color=INK, fontsize=11, pad=pad)
+
+    for x in ax:
+        x.grid(True, color=GRID, lw=0.6)
+        x.set_axisbelow(True)
+        x.tick_params(colors=MUTED, labelsize=9)
+        for sp in x.spines.values():
+            sp.set_color(GRID)
+            sp.set_linewidth(0.8)
+    ax[0].grid(False)
+
+    fig.suptitle(os.path.basename(a.pcap), fontsize=12.5, color=INK)
+    fig.savefig(out, dpi=140, facecolor="white")
+    print(f"written: {out}")
+    print(f"  {len(ts)} frames, {fs:.1f} Hz, {len(sc)} subcarriers, "
+          f"mean per-SC std {s.mean():.2f} dB")
+
+
+if __name__ == "__main__":
+    main()

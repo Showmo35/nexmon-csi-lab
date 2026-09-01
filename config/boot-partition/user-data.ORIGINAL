@@ -1,0 +1,29 @@
+#cloud-config
+manage_resolv_conf: false
+
+hostname: pi4b-nexmon
+manage_etc_hosts: true
+packages:
+- avahi-daemon
+apt:
+  preserve_sources_list: true
+  conf: |
+    Acquire {
+      Check-Date "false";
+    };
+timezone: America/New_York
+keyboard:
+  model: pc105
+  layout: "us"
+users:
+- name: nexmon
+  shell: /bin/bash
+  lock_passwd: false
+  passwd: "<REDACTED — password hash removed for documentation; see Raspberry Pi Imager settings>"
+  ssh_authorized_keys:
+    - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMGTlet+ahNFE5+zhSA34kbwaxsm+cx/WKyDKd0S9FlE showmik@windows-pc-nexmon"
+enable_ssh: true
+ssh_pwauth: false
+rpi:
+  interfaces:
+    serial: true

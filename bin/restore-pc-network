@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Revert this PC's wired connection from NAT/shared mode back to the plain
+# static lab link (as it was before the Nexmon project touched it).
+#
+# After running this the Pi is STILL REACHABLE over the cable at 10.0.0.100,
+# but it loses internet access.
+#
+# No sudo needed: polkit grants the desktop user
+# org.freedesktop.NetworkManager.settings.modify.system.
+
+set -euo pipefail
+CONN="Wired connection 1"
+ADDR=10.0.0.250/24
+
+echo "Current state:"
+nmcli -f ipv4.method,ipv4.addresses connection show "$CONN" | sed 's/^/  /'
+echo
+
+read -r -p "Revert '$CONN' to static $ADDR with no NAT? [y/N] " reply
+case "$reply" in
+  [yY]*) ;;
+  *) echo "Aborted."; exit 0 ;;
+esac
+
+nmcli connection modify "$CONN" ipv4.method manual ipv4.addresses "$ADDR"
+nmcli connection up "$CONN"
+
+echo
+echo "New state:"
+nmcli -f ipv4.method,ipv4.addresses connection show "$CONN" | sed 's/^/  /'
+echo "  ip_forward: $(cat /proc/sys/net/ipv4/ip_forward)"
+echo
+echo "Done. To re-enable internet sharing:"
+echo "  nmcli connection modify \"$CONN\" ipv4.method shared ipv4.addresses $ADDR"
+echo "  nmcli connection up \"$CONN\""

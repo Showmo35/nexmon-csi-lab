@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""
+One figure: all subcarriers overlaid, one subplot per transmit stream.
+
+  bin/csi-plot-streams <capture.pcap> [-o out.png] [--fctl 0x88] [--raw]
+                       [--t0 EPOCH] [--mark "10:20,30:40"] [--label WAVE]
+
+  --fctl   frame type to keep (default: the most numerous non-beacon type)
+  --raw    skip per-packet AGC removal
+  --t0     epoch seconds of the intended t=0, so marked intervals line up
+           with ground truth rather than with the first received frame
+  --mark   comma-separated start:end second ranges to shade (the activity)
+  --label  name for the shaded intervals
+
+Keeps a SINGLE 802.11 frame type. Mixing types - beacons especially - injects
+artifacts that have nothing to do with the channel. See
+../docs/10-collection-method.md.
+"""
+import argparse, sys, os
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, Normalize
+from matplotlib.cm import ScalarMappable
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+import csitools
+
+INK, MUTED, GRID = "#1f2328", "#5b6570", "#dfe3e8"
+ACCENT = "#d97b28"
+SEQ = LinearSegmentedColormap.from_list(
+    "seq", ["#cfe0f0", "#95bede", "#5590c4", "#2a66a3", "#123f6b"])
+TY = {0x80: "Beacon", 0x88: "QoS Data", 0x84: "0x84", 0x50: "Probe Resp"}
+
+
+def load_streams(path, fctl):
+    """Split a capture by transmit stream, using the nexcsi-backed reader.
+
+    nexcsi's structured array carries `css` (core/spatial-stream): the low 3
+    bits are the RX core, the next 3 the spatial stream.
+    """
+    rec = csitools.read_raw(path)
+    if fctl is None:
+        from collections import Counter
+        cnt = Counter(int(x) for x in rec["fctl"] if int(x) != 0x80)
+        fctl = cnt.most_common(1)[0][0]
+    rec = rec[rec["fctl"] == fctl]
+    ts = rec["ts_sec"].astype(np.float64) + rec["ts_usec"].astype(np.float64) / 1e6
+    csi = csitools.unpack(rec["csi"], fftshift=False)
+    stream = (rec["css"].astype(np.uint16) >> 3) & 0x7
+    out = {}
+    for s in np.unique(stream):
+        m = stream == s
+        out[int(s)] = (ts[m], csi[m])
+    return out, fctl
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("pcap")
+    ap.add_argument("-o", "--out", default="streams.png")
+    ap.add_argument("--fctl", default=None)
+    ap.add_argument("--raw", action="store_true")
+    ap.add_argument("--t0", type=float, default=None)
+    ap.add_argument("--mark", default="")
+    ap.add_argument("--label", default="ACTIVITY")
+    a = ap.parse_args()
+    path, out, raw = a.pcap, a.out, a.raw
+    fctl = int(a.fctl, 0) if a.fctl else None
+    marks = []
+    for m in filter(None, a.mark.split(",")):
+        lo, hi = m.split(":")
+        marks.append((float(lo), float(hi)))
+
+    streams, fctl = load_streams(path, fctl)
+    idx, sc = csitools.subcarrier_axis()
+    ns = sorted(streams)
+    print(f"frame type kept: {TY.get(fctl, hex(fctl))} (0x{fctl:02x})")
+
+    data = {}
+    for s in ns:
+        t, csi = streams[s]
+        db = 20 * np.log10(np.abs(csi[:, idx]) + 1e-9)
+        if not raw:
+            # remove the per-packet AGC gain (nexmon delivers CSI post-AGC;
+            # see issue #93). L2 per-packet normalisation, NOT RSSI rescaling -
+            # RSSI is too coarse here and makes it worse.
+            db = csitools.normalize_per_packet(db, method="l2")
+        data[s] = (t - (a.t0 if a.t0 else t[0]), db)
+        print(f"  stream {s}: {len(t):4d} frames, "
+              f"per-subcarrier std {np.median(db.std(axis=0)):.3f} dB")
+
+    fig, ax = plt.subplots(len(ns), 1, figsize=(12, 2.7 * len(ns)),
+                           constrained_layout=True, squeeze=False, sharex=True)
+    norm = Normalize(vmin=sc.min(), vmax=sc.max())
+    lim = np.percentile(np.abs(np.concatenate(
+        [(d - d.mean(axis=0)).ravel() for _, d in data.values()])), 99.7)
+
+    for i, s in enumerate(ns):
+        t, db = data[s]
+        D = db - db.mean(axis=0)
+        # Arrivals are BURSTY (dense clusters separated by multi-ms gaps).
+        # Plotting straight through a gap draws a false straight line that
+        # looks like interpolated data. Insert NaN at every gap so the line
+        # breaks and the reader sees where samples actually are.
+        gap = np.diff(t)
+        brk = np.where(gap > 5 * np.median(gap))[0]
+        tp = np.insert(t.astype(float), brk + 1, np.nan)
+        Dp = np.insert(D.astype(float), brk + 1, np.nan, axis=0)
+        for k in range(Dp.shape[1]):
+            ax[i, 0].plot(tp, Dp[:, k], lw=0.6, alpha=0.8, color=SEQ(norm(sc[k])))
+        ax[i, 0].set_ylim(-lim, lim)
+        ax[i, 0].set_title(f"stream {s}   —   {len(t)} frames, "
+                           f"per-subcarrier std {np.median(db.std(axis=0)):.2f} dB"
+                           f"   ({len(brk)} gaps, line broken)",
+                           color=INK, fontsize=10.5)
+        # shade the intervals the operator was asked to be active in
+        for j, (lo, hi) in enumerate(marks):
+            ax[i, 0].axvspan(lo, hi, color=ACCENT, alpha=0.13, lw=0, zorder=0,
+                             label=a.label if (i == 0 and j == 0) else None)
+        ax[i, 0].set_ylabel("|H| deviation (dB)", color=MUTED, fontsize=9)
+        ax[i, 0].grid(True, color=GRID, lw=0.6); ax[i, 0].set_axisbelow(True)
+        ax[i, 0].tick_params(colors=MUTED, labelsize=9)
+        for sp in ax[i, 0].spines.values():
+            sp.set_color(GRID); sp.set_linewidth(0.8)
+    ax[-1, 0].set_xlabel("time (s)", color=MUTED, fontsize=9)
+    if marks:
+        ax[0, 0].legend(frameon=False, labelcolor=INK, fontsize=9,
+                        loc="upper right")
+
+    cb = fig.colorbar(ScalarMappable(norm=norm, cmap=SEQ), ax=ax[:, 0],
+                      fraction=0.018, pad=0.01)
+    cb.set_label("subcarrier", color=MUTED, fontsize=9)
+    cb.ax.tick_params(colors=MUTED, labelsize=8); cb.outline.set_edgecolor(GRID)
+
+    span = max(t.max() for t, _ in data.values())
+    npk = max(len(t) for t, _ in data.values())
+    fig.suptitle(f"All {len(sc)} subcarriers overlaid, one panel per transmit stream\n"
+                 f"{TY.get(fctl, hex(fctl))} frames only"
+                 f"{'' if raw else ', AGC removed (per-packet L2)'}"
+                 f"  —  {npk} frames in {span:.1f}s (~{npk/span:.0f} Hz)",
+                 fontsize=12, color=INK)
+    fig.savefig(out, dpi=145, facecolor="white")
+    print(f"\nwritten: {out}")
+
+
+if __name__ == "__main__":
+    main()

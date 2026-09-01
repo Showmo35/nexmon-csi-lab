@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+"""Report what a CSI capture actually contains.
+
+    bin/csi-audit <capture.pcap> [more.pcap ...] [--hz N] [--json]
+
+Prints, per 802.11 frame type, the number of CSI *records*, the number of
+*distinct transmissions* behind them (unique sequence numbers), the
+inflation factor between the two, the real sampling rate, and how much of
+the capture that frame type spans.
+
+Record count is not sampling rate. Run this on every capture before you
+trust a number taken from it.
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.environ.get(
+    "CSITOOLS_ROOT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
+
+from csitools.audit import audit, check, format_audit  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("pcap", nargs="+")
+    ap.add_argument("--hz", type=float, default=None,
+                    help="warn if the real rate falls below this")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    bad = 0
+    for p in a.pcap:
+        res = audit(p)
+        problems = check(res, want_hz=a.hz)
+        if a.json:
+            print(json.dumps({**res, "problems": problems}, indent=2))
+        else:
+            print(p)
+            print(format_audit(res))
+            for m in problems:
+                print(f"  ! {m}")
+            if not problems:
+                print("  sound: one transmitter, one record per transmission, "
+                      "full coverage")
+            print()
+        bad += bool(problems)
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

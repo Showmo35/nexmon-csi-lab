@@ -1,0 +1,20 @@
+# private key material
+id_*
+*_rsa
+*_ed25519
+pi4b_nexmon*
+*.pem
+*.key
+
+# python
+__pycache__/
+*.pyc
+
+# bulk captures — data/reference/ is kept as the regression set
+projects/*/samples/*.pcap
+projects/*/*/samples/*.pcap
+*.pcap
+!data/reference/*.pcap
+
+# per-application project work is deliberately NOT published
+projects/

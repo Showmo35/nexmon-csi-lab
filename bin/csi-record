@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# Timed CSI capture with on-screen cues, for activity/motion experiments.
+#
+#   bin/csi-record <outdir> <label> [options]
+#
+#   -p, --pattern SPEC   activity schedule (default "10:10x3")
+#                          "10:10x3"  = 10s ACTIVE, 10s STILL, repeated 3x
+#   -l, --lead N         quiet lead-in seconds before the pattern (default 10)
+#   -a, --label-active   word shown during the active phase (default WAVE)
+#   -r, --rate HZ        offered traffic rate (default 200)
+#   -c, --chan SPEC      chanspec (default 161/20)
+#   -b, --bssid MAC      transmitter to filter on (default lab router 5 GHz)
+#   -n, --no-plot        capture only, skip plotting
+#
+# Prints a live countdown so YOU control the timing. Writes into <outdir>:
+#   <label>.pcap    the capture
+#   <label>.json    schedule + metadata (so the plot shades the right windows)
+#   <label>.png     amplitude + spectrogram, activity windows shaded
+#   <label>-overlay.png   all subcarriers overlaid on one axis, windows shaded
+#
+# Collection is delegated entirely to bin/csi-capture: separate client, Pi
+# receive-only, single-stream broadcast traffic. ~166 Hz measured, which is
+# Nyquist ~83 Hz - ample for hand motion at 1-3 Hz.
+#
+# This script previously drove the collection itself, with the Pi both
+# associated to the AP and extracting CSI. That yielded ~0.3 real
+# measurements per second (929 records, 25 distinct transmissions) - far
+# below the 1-3 Hz it was meant to observe, so every result from it is void.
+# See docs/10-collection-method.md.
+#
+# The cue clock starts when the CAPTURE starts, not when you run the command:
+# arming the Pi and associating the client take ~40 s first. csi-capture
+# prints CAPTURE-STARTED and this script waits for it.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export CSITOOLS_ROOT="$ROOT"
+
+OUTDIR="${1:?usage: csi-record <outdir> <label> [options]}"; shift
+LABEL="${1:?usage: csi-record <outdir> <label> [options]}"; shift
+PATTERN="10:10x3"; LEAD=10; ACTIVE="WAVE"; RATE=200; CHAN="161/20"
+BSSID="60:E3:27:FB:61:54"; PLOT=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--pattern) PATTERN="$2"; shift 2;;
+    -l|--lead) LEAD="$2"; shift 2;;
+    -a|--label-active) ACTIVE="$2"; shift 2;;
+    -r|--rate) RATE="$2"; shift 2;;
+    -c|--chan) CHAN="$2"; shift 2;;
+    -b|--bssid) BSSID="$2"; shift 2;;
+    -n|--no-plot) PLOT=0; shift;;
+    -h|--help) sed -n '2,30p' "$0"; exit 0;;
+    *) echo "unknown option: $1" >&2; exit 2;;
+  esac
+done
+
+ON=${PATTERN%%:*}; rest=${PATTERN#*:}; OFF=${rest%%x*}; REPS=${rest##*x}
+TOTAL=$(( LEAD + (ON + OFF) * REPS ))
+mkdir -p "$OUTDIR"
+PCAP="$OUTDIR/$LABEL.pcap"; META="$OUTDIR/$LABEL.json"; PNG="$OUTDIR/$LABEL.png"
+OVERLAY="$OUTDIR/$LABEL-overlay.png"
+LOG=$(mktemp); trap 'rm -f "$LOG"' EXIT
+
+echo "=== ${TOTAL}s run: ${LEAD}s lead-in, then ${ON}s ${ACTIVE} / ${OFF}s still x${REPS} ==="
+echo "=== preparing (Pi arming + client association, ~40s) ==="
+"$ROOT/bin/csi-capture" "$PCAP" "$TOTAL" --rate "$RATE" -c "$CHAN" -b "$BSSID" \
+    > >(tee "$LOG") 2>&1 &
+CAPPID=$!
+
+START=""
+for _ in $(seq 1 120); do
+  START=$(grep -m1 '^CAPTURE-STARTED ' "$LOG" 2>/dev/null | awk '{print $2}') || true
+  [ -n "$START" ] && break
+  kill -0 "$CAPPID" 2>/dev/null || { echo "capture failed before it started" >&2; wait "$CAPPID"; exit 1; }
+  sleep 1
+done
+[ -n "$START" ] || { echo "capture never reported a start" >&2; exit 1; }
+
+# ---- on-screen cues -------------------------------------------------------
+bold=$(tput bold 2>/dev/null || true); red=$(tput setaf 1 2>/dev/null || true)
+grn=$(tput setaf 2 2>/dev/null || true); rst=$(tput sgr0 2>/dev/null || true)
+phase_at() {
+  local t=$1
+  if [ "$t" -lt "$LEAD" ]; then echo "STILL"; return; fi
+  local k=$(( (t - LEAD) % (ON + OFF) ))
+  [ "$k" -lt "$ON" ] && echo "ACTIVE" || echo "STILL"
+}
+echo; echo "=== recording ==="
+prev=""
+while :; do
+  t=$(( $(date +%s) - START ))
+  [ "$t" -ge "$TOTAL" ] && break
+  [ "$t" -lt 0 ] && t=0
+  ph=$(phase_at "$t")
+  if [ "$ph" != "$prev" ]; then
+    if [ "$ph" = "ACTIVE" ]; then printf "\n%s%s>>> %s NOW <<<%s\n" "$bold" "$grn" "$ACTIVE" "$rst"
+    else printf "\n%s%s--- STILL ---%s\n" "$bold" "$red" "$rst"; fi
+    prev=$ph
+  fi
+  printf "\r  t=%3ds / %ds   [%s]   " "$t" "$TOTAL" "$ph"
+  sleep 1
+done
+printf "\n\n=== done, retrieving ===\n"
+wait "$CAPPID" || { echo "capture failed" >&2; exit 1; }
+
+# ---- metadata: the intended activity windows ------------------------------
+MARKS=""
+for (( r=0; r<REPS; r++ )); do
+  s=$(( LEAD + r * (ON + OFF) )); e=$(( s + ON ))
+  MARKS="${MARKS}${MARKS:+,}${s}:${e}"
+done
+cat > "$META" <<JSON
+{
+  "label": "$LABEL",
+  "start_epoch": $START,
+  "total_s": $TOTAL,
+  "lead_s": $LEAD,
+  "active_s": $ON,
+  "still_s": $OFF,
+  "reps": $REPS,
+  "active_label": "$ACTIVE",
+  "active_windows_s": "$MARKS",
+  "chanspec": "$CHAN",
+  "bssid": "$BSSID",
+  "traffic_rate_hz": $RATE,
+  "method": "csi-capture: separate client, Pi receive-only, unicast ping",
+  "pcap": "$(basename "$PCAP")"
+}
+JSON
+echo "  pcap : $PCAP"
+echo "  meta : $META"
+
+if [ "$PLOT" = "1" ]; then
+  # "auto" follows the traffic type: unicast gives QoS Data (0x88), the old
+  # broadcast workaround gave plain Data (0x08). Hardcoding either one makes
+  # the plot silently fall back to a handful of stray frames.
+  "$ROOT/bin/csi-plot-activity" "$PCAP" -o "$PNG" --fctl auto \
+      --t0 "$START" --mark "$MARKS" --label "$ACTIVE"
+  echo "  plot : $PNG"
+  # second view: every subcarrier overlaid on one axis, activity shaded.
+  # The activity plot picks ONE subcarrier for its spectrogram; this shows
+  # whether the whole comb moves together, which is what a hand crossing the
+  # path looks like.
+  "$ROOT/bin/csi-plot-streams" "$PCAP" -o "$OVERLAY" \
+      --t0 "$START" --mark "$MARKS" --label "$ACTIVE"
+  echo "  overlay: $OVERLAY"
+fi

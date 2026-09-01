@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""
+Plot CSI amplitude over time plus a spectrogram — for activity/motion tests.
+
+  csi-plot-activity <capture.pcap> -o <out.png> [--fctl 0x80] [--t0 EPOCH]
+                    [--mark "0:10,20:30,40:50"] [--label WAVE]
+
+  --fctl   frame type to keep (default: auto, most numerous non-beacon)
+  --t0     epoch seconds of the intended t=0, so marked intervals line up with
+           ground truth rather than with the first received frame
+  --mark   comma-separated start:end second ranges to shade (the activity)
+"""
+import os, sys, argparse
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy.signal import butter, filtfilt, stft
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+import csitools
+
+INK, MUTED, GRID = "#1f2328", "#5b6570", "#dfe3e8"
+ACCENT = "#d97b28"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("pcap")
+    ap.add_argument("-o", "--out", required=True)
+    ap.add_argument("--fctl", default="auto")
+    ap.add_argument("--t0", type=float, default=None)
+    ap.add_argument("--mark", default="")
+    ap.add_argument("--label", default="ACTIVITY")
+    a = ap.parse_args()
+
+    fctl = a.fctl if a.fctl == "auto" else int(a.fctl, 0)
+    ts, csi, rssi, macs = csitools.load(a.pcap, fctl=fctl)
+    idx, sc = csitools.subcarrier_axis()
+    db = 20 * np.log10(np.abs(csi[:, idx]) + 1e-9)
+    db = csitools.normalize_per_packet(db)          # remove AGC
+    # Impulsive outliers (nexmon_csi #100) are broadband, so a handful of them
+    # stripe the whole spectrogram and hide any real narrow line. Measured
+    # here: 1.22 % of samples, 21.5 % of frames touched.
+    db = csitools.despike(db)
+    t = ts - (a.t0 if a.t0 else ts[0])
+
+    fs = len(ts) / (ts[-1] - ts[0])
+    marks = []
+    for m in filter(None, a.mark.split(",")):
+        lo, hi = m.split(":"); marks.append((float(lo), float(hi)))
+
+    # uniform grid — arrivals are not perfectly periodic, and STFT assumes they are
+    grid = np.arange(t[0], t[-1], 1.0 / fs)
+    U = np.empty((len(grid), db.shape[1]))
+    for k in range(db.shape[1]):
+        U[:, k] = np.interp(grid, t, db[:, k])
+    fluct = U - U.mean(axis=0)
+
+    # The motion signal. NOT frame-to-frame differencing: at 159 Hz adjacent
+    # frames are 6 ms apart, so a difference is dominated by measurement noise
+    # while hand motion lives at 1-3 Hz. Measured on the wave/still test,
+    # median energy in the waving windows over the still windows:
+    #
+    #   frame-to-frame difference   1.9x
+    #   1-8 Hz band-pass envelope   9.0x
+    #
+    # So band-pass to the band the motion is actually in, then take the
+    # envelope. Falls back to differencing on captures too short to filter.
+    LO, HI = 1.0, 8.0
+    if len(grid) > 64 and fs > 2 * HI:
+        b, a_ = butter(4, [LO / (fs / 2), HI / (fs / 2)], btype="band")
+        band = filtfilt(b, a_, fluct, axis=0)
+        energy = np.sqrt((band ** 2).mean(axis=1))
+        w = max(1, int(0.25 * fs))              # ~0.25 s envelope smoothing
+        energy = np.convolve(energy, np.ones(w) / w, mode="same")
+        tE = grid
+        elabel = f"{LO:g}-{HI:g} Hz envelope"
+    else:
+        energy = np.sqrt((np.diff(fluct, axis=0) ** 2).mean(axis=1))
+        tE = grid[1:]
+        elabel = "frame-to-frame change"
+
+    fig, ax = plt.subplots(3, 1, figsize=(13, 9), constrained_layout=True,
+                           sharex=True, gridspec_kw={"height_ratios": [2, 1.4, 2]})
+
+    # (a) all subcarriers
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+    SEQ = LinearSegmentedColormap.from_list(
+        "seq", ["#cfe0f0", "#95bede", "#5590c4", "#2a66a3", "#123f6b"])
+    norm = Normalize(vmin=sc.min(), vmax=sc.max())
+    gap = np.diff(t); brk = np.where(gap > 5 * np.median(gap))[0]
+    tp = np.insert(t.astype(float), brk + 1, np.nan)
+    Dp = np.insert((db - db.mean(axis=0)).astype(float), brk + 1, np.nan, axis=0)
+    for k in range(Dp.shape[1]):
+        ax[0].plot(tp, Dp[:, k], lw=0.6, alpha=0.75, color=SEQ(norm(sc[k])))
+    ax[0].set_ylabel("|H| deviation (dB)", color=MUTED, fontsize=9)
+    ax[0].set_title(f"All {len(sc)} subcarriers   —   {len(ts)} frames, "
+                    f"{fs:.1f} Hz, RSSI {rssi.mean():.1f} dBm",
+                    color=INK, fontsize=11)
+
+    # (b) motion energy
+    ax[1].plot(tE, energy, lw=1.4, color="#2a66a3")
+    ax[1].set_ylabel("motion energy", color=MUTED, fontsize=9)
+    ax[1].set_title(f"Motion energy — {elabel}, averaged over subcarriers",
+                    color=INK, fontsize=11)
+
+    # (c) spectrogram of the most variable subcarrier
+    best = int(np.argmax(np.median(np.abs(fluct - np.median(fluct, axis=0)), axis=0)))
+    nper = min(64, max(16, len(fluct) // 8))
+    f_, t_, Z = stft(fluct[:, best], fs=fs, nperseg=nper, noverlap=nper * 3 // 4)
+    m = ax[2].pcolormesh(t_ + grid[0], f_, np.abs(Z), shading="gouraud", cmap="magma")
+    ax[2].set_ylabel("frequency (Hz)", color=MUTED, fontsize=9)
+    ax[2].set_xlabel("time (s)", color=MUTED, fontsize=9)
+    ax[2].set_title(f"Spectrogram, subcarrier {sc[best]:+d}   "
+                    f"(Nyquist {fs/2:.1f} Hz)", color=INK, fontsize=11)
+    fig.colorbar(m, ax=ax[2], fraction=0.03, pad=0.01)
+
+    for i, x in enumerate(ax):
+        for lo, hi in marks:
+            x.axvspan(lo, hi, color=ACCENT, alpha=0.13, lw=0,
+                      label=a.label if (i == 0 and (lo, hi) == marks[0]) else None)
+        x.grid(True, color=GRID, lw=0.6); x.set_axisbelow(True)
+        x.tick_params(colors=MUTED, labelsize=9)
+        for s in x.spines.values(): s.set_color(GRID); s.set_linewidth(0.8)
+    if marks:
+        ax[0].legend(frameon=False, labelcolor=INK, fontsize=9, loc="upper right")
+
+    fig.suptitle(os.path.basename(a.pcap), fontsize=12.5, color=INK)
+    fig.savefig(a.out, dpi=140, facecolor="white")
+    print(f"written: {a.out}")
+
+    # quantitative check against the marked intervals
+    if marks:
+        inside = np.zeros(len(tE), bool)
+        for lo, hi in marks:
+            inside |= (tE >= lo) & (tE < hi)
+        print(f"\n  motion energy inside  {a.label:9s}: {energy[inside].mean():.4f}")
+        print(f"  motion energy outside {a.label:9s}: {energy[~inside].mean():.4f}")
+        if energy[~inside].mean() > 0:
+            print(f"  ratio                          : "
+                  f"{energy[inside].mean()/energy[~inside].mean():.2f}x")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Full rig + CSI checkup: link -> Pi -> NAT -> firmware -> router -> live CSI.
+#
+#   bin/csi-checkup [--quick]
+#
+# --quick skips the live CSI capture (~60s faster).
+#
+# Distinguishes RIG FAULTS from ENVIRONMENT. A high lag-1 autocorrelation is
+# not a fault - it means something is moving near the path. Stand clear and
+# re-run before concluding anything is broken.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+ROOT=$PWD
+export CSITOOLS_ROOT="$ROOT"
+PC_IF=enp1s0; PC_IP=10.0.0.250; PI_IP=10.0.0.100; PI=pi4b-nexmon
+BSSID=60:E3:27:FB:61:54; SSID=nexmon-lab-5g; CHAN=161/20
+QUICK=0; [ "${1:-}" = "--quick" ] && QUICK=1
+
+fail=0; warn=0
+ok(){   printf '  \033[32m OK \033[0m %s\n' "$1"; }
+bad(){  printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=1; }
+wrn(){  printf '  \033[33mWARN\033[0m %s\n' "$1"; warn=1; }
+
+echo "== 1. physical link =="
+c=$(cat /sys/class/net/$PC_IF/carrier 2>/dev/null)
+if [ "$c" = "1" ]; then ok "$PC_IF up ($(cat /sys/class/net/$PC_IF/speed) Mb/s)"
+else bad "$PC_IF carrier=$c — cable unplugged or Pi powered off"; fi
+
+echo "== 2. PC addressing + NAT =="
+ip -br addr show $PC_IF 2>/dev/null | grep -q "$PC_IP" \
+  && ok "$PC_IF has $PC_IP" || bad "$PC_IF is not $PC_IP"
+[ "$(cat /proc/sys/net/ipv4/ip_forward)" = "1" ] \
+  && ok "ip_forward enabled" || wrn "ip_forward=0 — Pi has no internet"
+pgrep -f "dnsmasq.*$PC_IF" >/dev/null \
+  && ok "dnsmasq running (shared mode)" || wrn "no shared-mode dnsmasq"
+
+echo "== 3. Pi reachable =="
+if ping -c3 -W1 $PI_IP >/dev/null 2>&1; then
+  ok "ping $PI_IP ($(ping -c3 -W1 $PI_IP 2>/dev/null | tail -1 | cut -d'/' -f5) ms avg)"
+else bad "cannot ping $PI_IP"; fi
+if out=$(ssh -o BatchMode=yes -o ConnectTimeout=10 $PI 'hostname' 2>&1); then
+  ok "ssh -> $out ($(ssh -o BatchMode=yes $PI 'uptime -p' 2>/dev/null))"
+else bad "ssh failed: $out"; fi
+
+echo "== 4. Pi firmware + tools =="
+if [ $fail -eq 0 ]; then
+  fw=$(ssh -o BatchMode=yes $PI 'sudo dmesg | grep "preinit_dcmds: Firmware" | tail -1' 2>/dev/null)
+  case "$fw" in
+    *nexmon.org/csi*) ok "patched firmware: $(echo "$fw" | sed 's/.*version //')" ;;
+    *)                bad "STOCK firmware loaded, CSI patch not active" ;;
+  esac
+  alt=$(ssh -o BatchMode=yes $PI 'sudo update-alternatives --query cyfmac43455-sdio.bin 2>/dev/null | grep ^Value' 2>/dev/null)
+  case "$alt" in *nexmon*) ok "firmware alternative -> nexmon" ;;
+                 *)        wrn "firmware alternative not set to nexmon" ;; esac
+  ssh -o BatchMode=yes $PI 'command -v nexutil >/dev/null && command -v makecsiparams >/dev/null' 2>/dev/null \
+    && ok "nexutil + makecsiparams present" || bad "nexutil/makecsiparams missing"
+fi
+
+echo "== 5. router =="
+# nmcli rate-limits rescans; a failed rescan leaves a stale list, so retry and
+# fall back to the cached list rather than reporting a false negative.
+found=0
+for attempt in 1 2 3; do
+  nmcli dev wifi rescan >/dev/null 2>&1 || true
+  sleep 4
+  nmcli -f SSID,BSSID,SIGNAL dev wifi list 2>/dev/null | grep -qi "$SSID" && { found=1; break; }
+done
+if [ $found -eq 1 ]; then
+  ok "$SSID visible ($(nmcli -f SSID,SIGNAL dev wifi list 2>/dev/null | grep -i "$SSID" | head -1 | awk '{print $NF}') signal)"
+else bad "$SSID not broadcasting — router off or reconfigured"; fi
+
+if [ $QUICK -eq 1 ] || [ $fail -ne 0 ]; then
+  echo; [ $fail -eq 0 ] && echo "Rig OK (CSI capture skipped)." || echo "FAILURES above — see docs/06-troubleshooting.md"
+  exit $fail
+fi
+
+echo "== 6. live CSI capture =="
+echo "  (borrows this PC's Wi-Fi for ~20 s; eduroam is restored automatically)"
+TMP=$(mktemp -u /tmp/checkup_XXXX.pcap)
+if bash "$ROOT/bin/csi-capture" "$TMP" 15 >/tmp/checkup_log 2>&1; then
+  ok "collection succeeded"
+  python3 - "$TMP" <<'PY'
+import sys, os
+sys.path.insert(0, os.environ["CSITOOLS_ROOT"])
+import csitools
+import numpy as np
+G="\033[32m OK \033[0m"; W="\033[33mWARN\033[0m"; B="\033[31mFAIL\033[0m"
+
+# 1. Is this a real sample of the channel, or repeated records of a few
+#    frames? The absence of this check is what hid the old collection bug.
+a = csitools.audit(sys.argv[1])
+best = max((d for d in a["types"] if not d["control"] and d["fctl"] != 0x80),
+           key=lambda d: d["records"], default=None)
+if best is None:
+    print(f"  {B} no data frames at all - is a client generating traffic?")
+    sys.exit(10)
+print(f"  {G if len(a['macs'])==1 else B} single source: {','.join(a['macs'])}")
+print(f"  {G if best['inflation']<1.5 else B} {best['name']}: {best['records']} records / "
+      f"{best['distinct']} distinct = {best['inflation']:.1f}x   (want ~1.0)")
+print(f"  {G if best['rate']>150 else W} real rate {best['rate']:.0f} Hz            (reference ~199)")
+print(f"  {G if best['coverage']>0.9 else B} covers {best['coverage']*100:.0f}% of the capture   (want ~100)")
+
+ts, csi, rssi, macs = csitools.load(sys.argv[1], fctl=best["fctl"])
+idx, sc = csitools.subcarrier_axis(csi.shape[1])
+db = 20*np.log10(np.abs(csi[:, idx])+1e-9)
+fl = db - db.mean(axis=0)
+adj = float(np.mean([np.corrcoef(fl[:, i], fl[:, i+1])[0, 1] for i in range(len(sc)-1)]))
+print(f"  {G if rssi.mean()>-60 else W} RSSI {rssi.mean():.0f} dBm")
+print(f"  {G if adj>0.7 else W} adjacent-SC corr {adj:+.2f}       (want >0.7, smooth in frequency)")
+
+# 2. Motion indicator at a FIXED TIME LAG, not a fixed sample lag. At 166 Hz
+#    consecutive samples are 6 ms apart and a real static channel is still
+#    ~+0.9 correlated there, so the old lag-1 test would flag every good
+#    capture as moving. A quiet room decorrelates by ~200 ms.
+fs = len(ts)/(ts[-1]-ts[0])
+L = max(1, int(round(0.5*fs)))
+half = (float(np.mean([np.corrcoef(fl[:-L, i], fl[L:, i])[0, 1] for i in range(len(sc))]))
+        if L < len(fl)-10 else float("nan"))
+if not (half > 0.3):
+    print(f"  {G} 0.5 s autocorr {half:+.2f}          (decorrelated = environment static)")
+else:
+    print(f"  {W} 0.5 s autocorr {half:+.2f}          (>0.3 = SOMETHING IS MOVING near the")
+    print(f"       path, or slowly drifting - the environment, not a rig fault)")
+
+warned = (len(a["macs"]) != 1 or best["inflation"] >= 1.5 or best["rate"] <= 100
+          or best["coverage"] <= 0.9 or adj <= 0.7 or half > 0.3)
+sys.exit(10 if warned else 0)
+PY
+  [ $? -eq 10 ] && warn=1
+  rm -f "$TMP"
+else
+  bad "collection failed — $(tail -2 /tmp/checkup_log | head -1)"
+fi
+
+echo
+if [ $fail -ne 0 ]; then echo "FAILURES above — see docs/06-troubleshooting.md"
+elif [ $warn -ne 0 ]; then echo "Rig functional, warnings above."
+else echo "All checks passed."; fi
+exit $fail

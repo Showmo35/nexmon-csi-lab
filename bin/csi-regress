@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Regression check: does the pipeline still read the reference captures the
+same way it did when they were recorded?
+
+    bin/csi-regress            # check against data/reference/expected.json
+    bin/csi-regress --update   # re-record the expectations (only after a
+                               # deliberate, understood change)
+
+data/reference/ holds three captures taken with bin/csi-capture on
+2026-08-31. They exist to catch silent breakage in the vendored nexcsi
+decoder, in csitools' header handling, or in the subcarrier axis - the kind
+of change that does not raise an exception but shifts every number.
+
+Checked per capture: record count, distinct transmissions, frame-type mix,
+source MAC, chanspec, RSSI, and the mean CSI magnitude per subcarrier.
+"""
+import argparse
+import json
+import os
+import sys
+
+import numpy as np
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
+import csitools  # noqa: E402
+
+REF = os.path.join(_ROOT, "data", "reference")
+EXPECTED = os.path.join(REF, "expected.json")
+
+
+def measure(path):
+    raw = csitools.read_raw(path)
+    a = csitools.audit(path)
+    # the frame type actually analysed - the same choice csitools.load()
+    # makes. Hardcoding one type silently measured 13 stray frames instead of
+    # the 2788 that carry the measurement when the traffic type changed.
+    ts, csi, rssi, macs = csitools.load(path, fctl="auto")
+    fctl = int(a["types"][0]["fctl"]) if a["types"] else None
+    for d in a["types"]:
+        if not d["control"] and d["fctl"] != 0x80:
+            fctl = d["fctl"]
+            break
+    idx, sc = csitools.subcarrier_axis(csi.shape[1])
+    db = 20 * np.log10(np.abs(csi[:, idx]) + 1e-9)
+    return {
+        "records": a["n_records"],
+        "analysed_frame_type": csitools.frame_type_name(fctl),
+        "macs": a["macs"],
+        "chanspec": int(raw["csp"][0]),
+        "types": {d["name"]: [d["records"], d["distinct"]] for d in a["types"]},
+        "n_data": len(ts),
+        "subcarriers": int(csi.shape[1]),
+        "rssi_mean": round(float(rssi.mean()), 2),
+        # the CFR shape: sensitive to decoder, byte order and axis changes
+        "cfr_mean_db": [round(float(x), 3) for x in db.mean(axis=0)],
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--update", action="store_true")
+    args = ap.parse_args()
+
+    pcaps = sorted(f for f in os.listdir(REF) if f.endswith(".pcap"))
+    if not pcaps:
+        print(f"no captures in {REF}", file=sys.stderr)
+        return 2
+    current = {f: measure(os.path.join(REF, f)) for f in pcaps}
+
+    if args.update:
+        with open(EXPECTED, "w") as fh:
+            json.dump(current, fh, indent=1, sort_keys=True)
+        print(f"recorded expectations for {len(current)} captures -> {EXPECTED}")
+        return 0
+
+    if not os.path.exists(EXPECTED):
+        print(f"{EXPECTED} missing — run: bin/csi-regress --update", file=sys.stderr)
+        return 2
+    expected = json.load(open(EXPECTED))
+
+    bad = 0
+    for f in pcaps:
+        want, got = expected.get(f), current[f]
+        if want is None:
+            print(f"  ?  {f}: no recorded expectation")
+            bad += 1
+            continue
+        diffs = []
+        for k in want:
+            if k == "cfr_mean_db":
+                d = np.abs(np.array(want[k]) - np.array(got[k])).max()
+                if d > 1e-3:
+                    diffs.append(f"cfr_mean_db max |delta| {d:.4f} dB")
+            elif want[k] != got[k]:
+                diffs.append(f"{k}: {want[k]!r} -> {got[k]!r}")
+        if diffs:
+            bad += 1
+            print(f"  FAIL {f}")
+            for d in diffs:
+                print(f"       {d}")
+        else:
+            print(f"  ok   {f}  {got['n_data']} data frames, "
+                  f"{got['subcarriers']} subcarriers, RSSI {got['rssi_mean']} dBm")
+    print("\nregression: " + ("FAILED" if bad else "all captures match"))
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

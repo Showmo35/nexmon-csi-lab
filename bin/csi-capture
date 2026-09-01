@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# Standard CSI capture: AP transmits, a CLIENT pings it, the Pi listens.
+#
+#   bin/csi-capture <out.pcap> [seconds] [options]
+#
+#   -r, --rate HZ      ping rate from the client (default 200)
+#       --client WHO   self  - borrow THIS PC's Wi-Fi as the client (default)
+#                      none  - some other device is already pinging the AP
+#   -t, --traffic KIND ping  - unicast ICMP to the AP (default). Every reply
+#                              is sent immediately, so arrivals are EVENLY
+#                              spaced. Measured: 5.0 ms cadence, 159 Hz.
+#                      bcast - UDP broadcast. Only for when no client can be
+#                              driven; see below.
+#
+# WHY UNICAST, AND WHAT BROADCAST COSTS
+# -------------------------------------
+# Both put frames in the air at ~160-180 Hz, but they are not equivalent:
+#
+#                     median gap   spacing            time in gaps >50ms
+#   --traffic ping      5.0 ms     EVEN (p25 4.9, p90 5.1)      29%
+#   --traffic bcast     0.2 ms     bunched into DTIM batches    88%
+#
+# An AP buffers broadcast until a DTIM beacon and then sends the batch back to
+# back: ~37 frames inside 19 ms, then ~186 ms of nothing. Those 37 frames are
+# 37 looks at the SAME channel instant - the channel cannot change in 19 ms -
+# so the effective sampling rate is the batch rate, ~5 Hz, not 180 Hz.
+# Unicast replies are never buffered, so every frame is its own measurement.
+#
+# Broadcast was only ever a workaround for the receiver being 1x1: a 2x2
+# client made the AP rate-adapt to two spatial streams the Pi cannot decode
+# (measured: 1.9 Hz of QoS Data against a 200 Hz ping). Setting the router to
+# Wireless Network Mode = A-Only forces legacy single-stream OFDM for ALL
+# traffic and removes that constraint - see docs/21-tl-wdr4300.md. With
+# A-Only set, unicast works and is strictly better.
+#   -c, --chan SPEC    chanspec (default 161/20)
+#   -b, --bssid MAC    AP radio to filter on (default lab router 5 GHz)
+#   -s, --ssid NAME    AP to associate the client to (default nexmon-lab-5g)
+#
+# THE THREE ROLES, KEPT SEPARATE
+#   1. transmitter  the TL-WDR4300 on a fixed channel
+#   2. client       associates to it and pings it, so the AP emits a steady
+#                   stream of unicast QoS Data. NOT the Pi - see bin/csi-sniff
+#                   for what happens when the Pi tries to be both.
+#   3. receiver     the Pi, monitor mode only, bin/csi-sniff
+#
+# --client self uses this PC's ONE Wi-Fi radio, so eduroam goes down for the
+# duration of the capture. That is the whole cost. The Pi link is Ethernet, so
+# SSH is unaffected throughout.
+#
+# INTERNET IS RESTORED ON EVERY EXIT PATH - normal end, error, or Ctrl-C - by
+# an EXIT trap. The Pi is armed BEFORE the Wi-Fi is touched (~30 s of driver
+# reload), so the outage is the capture length plus a few seconds, not more.
+# If the restore ever fails the script says so loudly and prints the manual
+# command; nothing silently leaves you offline.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export CSITOOLS_ROOT="$ROOT"
+
+OUT="${1:?usage: csi-capture <out.pcap> [seconds] [options]}"; shift
+SECS=30
+case "${1:-}" in ''|-*) ;; *) SECS="$1"; shift;; esac
+RATE=200; CLIENT=self; CHAN="161/20"; CORE=1; STREAM=1; TRAFFIC=ping
+BSSID="60:E3:27:FB:61:54"; SSID="nexmon-lab-5g"; GW="192.168.1.1"
+WIFI_IF="${WIFI_IF:-wlp2s0}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -r|--rate)   RATE="$2"; shift 2;;
+    --client)    CLIENT="$2"; shift 2;;
+    -t|--traffic) TRAFFIC="$2"; shift 2;;
+    -c|--chan)   CHAN="$2"; shift 2;;
+    -b|--bssid)  BSSID="$2"; shift 2;;
+    -C|--core)   CORE="$2"; shift 2;;
+    -N|--stream) STREAM="$2"; shift 2;;
+    -s|--ssid)   SSID="$2"; shift 2;;
+    -h|--help)   sed -n '2,32p' "$0"; exit 0;;
+    *) echo "unknown option: $1" >&2; exit 2;;
+  esac
+done
+IVL=$(python3 -c "print(f'{1/$RATE:.4f}')")
+
+# ---------------------------------------------------------------- restore --
+ORIG=""; PINGPID=""
+restore() {
+  local rc=$?
+  [ -n "$PINGPID" ] && kill "$PINGPID" 2>/dev/null || true
+  if [ -n "$ORIG" ]; then
+    echo "restoring $ORIG ..."
+    if nmcli -w 30 con up "$ORIG" >/dev/null 2>&1; then
+      sleep 2
+      if ping -c1 -W3 -q 1.1.1.1 >/dev/null 2>&1 || \
+         ping -c1 -W3 -q 8.8.8.8 >/dev/null 2>&1; then
+        echo "  internet is back ($ORIG)"
+      else
+        echo "  WARNING: $ORIG is up but no internet yet - it may just need" >&2
+        echo "           a few more seconds, or a re-auth for eduroam." >&2
+      fi
+    else
+      echo "" >&2
+      echo "  *** COULD NOT RESTORE $ORIG - run this yourself: ***" >&2
+      echo "      nmcli con up '$ORIG'" >&2
+      echo "" >&2
+    fi
+  fi
+  return $rc
+}
+
+if [ "$CLIENT" = self ]; then
+  ORIG=$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null \
+         | awk -F: -v d="$WIFI_IF" '$NF==d{NF--; print}' OFS=:)
+  [ -n "$ORIG" ] || { echo "no active connection on $WIFI_IF - nothing to restore, aborting" >&2; exit 2; }
+  echo "client = this PC. '$ORIG' goes down for ~$((SECS+10))s and comes back automatically."
+fi
+
+# --------------------------------------------------- 1. arm the Pi FIRST ---
+# Done while the PC is still on eduroam: this is the slow part (~30 s).
+"$ROOT/bin/csi-sniff" --arm-only -c "$CHAN" -b "$BSSID" -C "$CORE" -N "$STREAM"
+
+# ------------------------------------------------- 2. become the client ----
+if [ "$CLIENT" = self ]; then
+  trap 'restore' EXIT INT TERM
+  # never-default: the lab AP has no uplink, so it must not become the
+  # default route even briefly. ignore-auto-dns for the same reason.
+  # powersave 2 = DISABLE. With power save on, the client batches its
+  # transmissions and the AP's re-broadcast follows: measured 55-frame bursts
+  # every ~360 ms with ~30% of the capture dead. CSI needs an even cadence.
+  nmcli con modify "$SSID" ipv4.never-default yes ipv4.ignore-auto-dns yes \
+                           connection.autoconnect no \
+                           802-11-wireless.powersave 2 2>/dev/null || true
+  echo "associating to $SSID ..."
+  nmcli -w 30 con up "$SSID" >/dev/null 2>&1 \
+    || { echo "ERROR: could not associate to $SSID (wrong PSK, or the router is off)" >&2; exit 3; }
+  OK=0
+  for i in 1 2 3 4 5 6 7 8; do
+    if ping -c1 -W2 -q -I "$WIFI_IF" "$GW" >/dev/null 2>&1; then OK=1; break; fi
+    sleep 1
+  done
+  [ "$OK" = 1 ] || { echo "ERROR: associated to $SSID but cannot reach $GW" >&2; exit 4; }
+  echo "  associated, $(ip -4 -br addr show "$WIFI_IF" | awk '{print $3}') -> $GW reachable"
+
+  # 3. generate the traffic. Every echo REPLY is a unicast QoS Data frame
+  #    transmitted by the AP - that is what the Pi measures. Non-root ping
+  #    is allowed down to a 2 ms interval on this machine, so no sudo.
+  case "$TRAFFIC" in
+    ping)
+      ping -i "$IVL" -q -I "$WIFI_IF" "$GW" >/dev/null 2>&1 &
+      ;;
+    bcast)
+      # The AP bridges: a broadcast from one wireless client is re-transmitted
+      # into the BSS for the others. Broadcast has no rate negotiation, so it
+      # goes out at the lowest basic rate on ONE spatial stream - which is the
+      # only thing a 1x1 receiver can decode.
+      python3 -u -c "
+import socket, time, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b'$WIFI_IF')
+ivl = $IVL
+nxt = time.time()
+while True:
+    s.sendto(b'csi' * 20, ('255.255.255.255', 5001))
+    nxt += ivl
+    d = nxt - time.time()
+    if d > 0: time.sleep(d)
+    else: nxt = time.time()
+" >/dev/null 2>&1 &
+      ;;
+    *) echo "unknown --traffic: $TRAFFIC (want ping or bcast)" >&2; exit 2;;
+  esac
+  PINGPID=$!
+  sleep 1
+  kill -0 "$PINGPID" 2>/dev/null || { echo "ERROR: traffic generator died immediately (rate $RATE Hz too fast?)" >&2; exit 5; }
+  echo "  traffic: $TRAFFIC at $RATE Hz"
+  # What the AP is actually transmitting to us. A rate above ~65 Mb/s at
+  # 20 MHz means MULTIPLE SPATIAL STREAMS, which a 1x1 receiver like the Pi
+  # cannot decode - it will then extract CSI from almost none of these frames
+  # even though the link itself is perfect. See docs/10-collection-method.md.
+  LINKRATE=$(iwconfig "$WIFI_IF" 2>/dev/null \
+             | sed -n 's/.*Bit Rate[=:]\([0-9.]*\) *\([A-Za-z\/]*\).*/\1 \2/p')
+  echo "  AP -> client link: ${LINKRATE:-unknown}"
+else
+  echo "client = external. Make sure it is associated to $SSID and pinging $GW."
+fi
+
+# ------------------------------------------------------ 4. capture ---------
+# Marker so a wrapper (bin/csi-record) knows when the capture ACTUALLY began -
+# arming and association take ~40 s before this point, and activity windows
+# have to line up with the capture, not with the command.
+echo "CAPTURE-STARTED $(date +%s)"
+"$ROOT/bin/csi-sniff" --no-arm -c "$CHAN" -b "$BSSID" -C "$CORE" -N "$STREAM" "$OUT" "$SECS"

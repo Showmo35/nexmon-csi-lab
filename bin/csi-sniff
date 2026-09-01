@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# Standard nexmon_csi collection: the Pi is a RECEIVER ONLY.
+#
+#   bin/csi-sniff <out.pcap> [seconds] [options]
+#   bin/csi-sniff --arm-only [options]
+#
+#   -c, --chan SPEC    chanspec (default 161/20)
+#   -b, --bssid MAC    transmitter to filter on (default the lab router 5GHz);
+#                      "any" captures every transmitter on the channel, which
+#                      is how you find out whether a client is transmitting
+#   -C, --core MASK    RX core bitmask (default 1)
+#   -N, --stream MASK  spatial-stream bitmask (default 1)
+#       --arm-only     reload the driver, apply params, enter monitor mode,
+#                      verify CSI is flowing - then stop, leaving the Pi armed
+#       --no-arm       skip all of that and capture immediately (the Pi must
+#                      already be armed)
+#
+# This is the configuration nexmon_csi is designed for and the one published
+# work uses (e.g. arXiv:2111.09091): a separate device transmits, the Pi sits
+# in monitor mode and extracts CSI from what it hears. The Pi does not
+# associate, does not hold an IP, does not ping anything.
+#
+# WHY THE PI MUST NOT ALSO BE THE CLIENT
+# --------------------------------------
+# The removed bin/csi-collect associated the Pi to the AP and pinged it.
+# Auditing its captures with bin/csi-audit showed what that really produced
+# (an 82 s activity capture, since deleted along with the script):
+#
+#     QoS Data      929 records ... 25 distinct sequence numbers ... 37.2x
+#     BlockAckReq   250 records
+#     Disassoc       10 records
+#
+# 929 records, 25 actual transmissions - 0.3 real measurements per second
+# across an 82 s capture, not the 22 Hz the record count suggested. The
+# BlockAckReq and Disassoc frames say why: with CSI extraction armed the Pi
+# stops acknowledging reliably, so the AP retransmits each frame many times
+# (a retry reuses its sequence number) and eventually drops the client. The
+# duplicates are the AP shouting, not the channel being sampled.
+#
+# Removing the Pi from the transmit side removes all of it. Nothing here
+# reloads the driver mid-run, re-applies parameters on a live association, or
+# depends on an ordering discovered by trial - there is no association to
+# destabilise.
+#
+# YOU STILL NEED A TRANSMITTER. The Pi only measures what is in the air, and
+# beacons alone are unusable (5.3 dB per-subcarrier std even in a clean
+# monitor-only capture). bin/csi-capture supplies the client traffic; see
+# docs/10-collection-method.md.
+#
+# --arm-only / --no-arm exist so a caller can pay the ~30 s arming cost
+# BEFORE it disturbs anything else - bin/csi-capture arms the Pi while the
+# PC is still on eduroam, and only then switches the Wi-Fi to the lab AP.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export CSITOOLS_ROOT="$ROOT"
+
+CHAN="161/20"; BSSID="60:E3:27:FB:61:54"; ARM=1; CAPTURE=1
+CORE=1; STREAM=1
+OUT=""; SECS=30; POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c|--chan)  CHAN="$2"; shift 2;;
+    -b|--bssid) BSSID="$2"; shift 2;;
+    -C|--core)   CORE="$2"; shift 2;;
+    -N|--stream) STREAM="$2"; shift 2;;
+    --arm-only) CAPTURE=0; shift;;
+    --no-arm)   ARM=0; shift;;
+    -h|--help)  sed -n '2,48p' "$0"; exit 0;;
+    -*) echo "unknown option: $1" >&2; exit 2;;
+    *)  POSITIONAL+=("$1"); shift;;
+  esac
+done
+if [ "$CAPTURE" = 1 ]; then
+  OUT="${POSITIONAL[0]:?usage: csi-sniff <out.pcap> [seconds] [options]}"
+  SECS="${POSITIONAL[1]:-30}"
+fi
+HOST="${PI_HOST:-pi4b-nexmon}"
+REMOTE="/tmp/sniff_$(date +%s).pcap"
+
+if [ "$ARM" = 1 ]; then
+  echo "csi-sniff: arming the Pi  chan $CHAN  core $CORE  stream $STREAM  filter $BSSID  (receive only)"
+  timeout 120 ssh -o BatchMode=yes "$HOST" "
+set -e
+# 1. clean driver state. Nothing else touches the radio afterwards.
+sudo modprobe -r brcmfmac_wcc 2>/dev/null || true
+sudo modprobe -r brcmfmac_cyw 2>/dev/null || true
+sudo modprobe -r brcmfmac 2>/dev/null || true
+sleep 2; sudo modprobe brcmfmac; sleep 6
+sudo nmcli dev set wlan0 managed no 2>/dev/null || true
+sudo rfkill unblock wifi 2>/dev/null || true
+sudo ip link set wlan0 up
+sleep 2
+
+# 2. arm the extractor, then enter monitor mode. Order matches
+#    /usr/local/bin/csi-enable on the Pi: params, then -m1. This is nexmon's
+#    own monitor mode, NOT a mac80211 vif - 'iw dev wlan0 interface add mon0
+#    type monitor' fails on this driver. CSI arrives as UDP to port 5500.
+if [ '$BSSID' = any ]; then
+  P=\$(makecsiparams -c $CHAN -C $CORE -N $STREAM)
+else
+  P=\$(makecsiparams -c $CHAN -C $CORE -N $STREAM -m $BSSID)
+fi
+sudo nexutil -Iwlan0 -s500 -b -l34 -v\"\$P\" >/dev/null
+sudo nexutil -Iwlan0 -m1
+M=\$(sudo nexutil -Iwlan0 -m | tr -dc 0-9)
+[ \"\$M\" = \"1\" ] || { echo \"ERROR: monitor mode did not stick (nexutil -m reports '\$M')\" >&2; exit 4; }
+sleep 1
+
+# 3. prove CSI is flowing BEFORE committing to a run - a wrong channel or a
+#    silent transmitter makes tcpdump sit there with no error at all.
+#    The AP's beacons alone satisfy this, so it works with no client yet.
+sudo rm -f /tmp/sniff_probe.pcap
+sudo timeout 12 tcpdump -i wlan0 dst port 5500 -c 3 -w /tmp/sniff_probe.pcap >/dev/null 2>&1 || true
+if [ ! -s /tmp/sniff_probe.pcap ]; then
+  echo 'ERROR: no CSI in 12s. Nothing is transmitting on this channel from' >&2
+  echo \"       $BSSID, or the router has hopped off channel $CHAN.\" >&2
+  exit 5
+fi
+" || { echo "arming FAILED on the Pi" >&2; exit 1; }
+  echo "  armed"
+fi
+
+[ "$CAPTURE" = 1 ] || exit 0
+
+echo "csi-sniff: capturing ${SECS}s -> $OUT"
+timeout $(( SECS + 90 )) ssh -o BatchMode=yes "$HOST" "
+set -e
+sudo rm -f $REMOTE
+sudo timeout $SECS tcpdump -i wlan0 dst port 5500 -w $REMOTE >/dev/null 2>&1 || true
+sudo chmod 644 $REMOTE
+[ -s $REMOTE ] || { echo 'ERROR: capture is empty' >&2; exit 6; }
+" || { echo "capture FAILED on the Pi" >&2; exit 1; }
+
+scp -q -o BatchMode=yes "$HOST:$REMOTE" "$OUT"
+ssh -o BatchMode=yes "$HOST" "sudo rm -f $REMOTE" 2>/dev/null || true
+
+"$ROOT/bin/csi-audit" "$OUT" || true
+echo "saved: $OUT"

@@ -1,0 +1,16 @@
+# Raspberry Pi 4B — Nexmon CSI project
+# Direct point-to-point Ethernet link from this PC (10.0.0.250) to the Pi.
+Host pi4b-nexmon
+    HostName 10.0.0.100
+    User nexmon
+    IdentityFile ~/.ssh/pi4b_nexmon
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
+
+# Fallback: try mDNS instead of the static IP (both ends run avahi).
+Host pi4b-nexmon-mdns
+    HostName pi4b-nexmon.local
+    User nexmon
+    IdentityFile ~/.ssh/pi4b_nexmon
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
