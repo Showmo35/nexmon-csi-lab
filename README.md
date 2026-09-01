@@ -174,4 +174,5 @@ See `docs/02-network-topology.md` and `docs/21-tl-wdr4300.md`.
 
 ## License
 
-MIT — see `LICENSE`. Vendored `nexcsi` remains under its own MIT license.
+MIT — see `LICENSE`. Third-party components and their terms are listed in
+`NOTICE`.

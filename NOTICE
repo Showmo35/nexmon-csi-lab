@@ -1,0 +1,20 @@
+Third-party components
+======================
+
+This repository vendors third-party code, which remains under its own license.
+
+nexcsi 0.5.2
+------------
+  MIT License, Copyright (c) nexmonster
+  https://github.com/nexmonster/nexcsi
+  Vendored unmodified under vendor/nexcsi/ — see vendor/README.md for why it
+  is vendored rather than installed, and how to update it.
+
+Not included in this repository
+-------------------------------
+  nexmon_csi — the firmware patch this tooling depends on. It is built on the
+  Raspberry Pi and is not redistributed here; see
+  https://github.com/seemoo-lab/nexmon_csi for its terms.
+
+  CSIKit — used only as an independent validation reference during decoder
+  verification; see docs/11-validation.md.

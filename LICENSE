@@ -19,14 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-This repository vendors third-party code under vendor/, which remains under
-its own license:
-
-  nexcsi 0.5.2 — MIT License — Copyright (c) nexmonster
-  https://github.com/nexmonster/nexcsi
-
-The firmware patch this tooling depends on, nexmon_csi, is not included here;
-see https://github.com/seemoo-lab/nexmon_csi for its terms.
