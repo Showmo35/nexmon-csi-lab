@@ -172,7 +172,22 @@ See `docs/02-network-topology.md` and `docs/21-tl-wdr4300.md`.
   holding the SSH key has root. Remove it when the build is complete.
 - The SSH private key is not in this repository.
 
+## Built on
+
+- **[nexmon](https://github.com/seemoo-lab/nexmon)** and
+  **[nexmon_csi](https://github.com/seemoo-lab/nexmon_csi)** (Secure Mobile
+  Networking Lab, TU Darmstadt) — the firmware patch that makes CSI
+  extraction possible at all. Built from upstream on the Pi; see
+  `docs/05-nexmon-csi-install.md`.
+- **[nexcsi](https://github.com/nexmonster/nexcsi)** by Aravind Reddy Voggu —
+  the CSI decoder, bundled unmodified in `vendor/`. Nothing here reimplements
+  pcap parsing or CSI decoding.
+- **[CSIKit](https://github.com/Gi-z/CSIKit)** by Glenn Forbes — used as an
+  independent reference when validating the decoder; see
+  `docs/11-validation.md`.
+
 ## License
 
-MIT — see `LICENSE`. Third-party components and their terms are listed in
-`NOTICE`.
+MIT — see `LICENSE`. This covers the code in this repository. The tools above
+are separate projects with their own terms; nexmon_csi in particular is built
+from upstream on your own Pi and is not redistributed here.
